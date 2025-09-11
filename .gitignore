@@ -87,6 +87,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# BUT KEEP source Python files
+!*.py
+!**/*.py
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -430,6 +434,15 @@ temporary/
 # KEEP THESE FILES (negated patterns)
 # ==============================================================================
 
+# Keep ALL Python package files and source code
+!**/__init__.py
+!src/
+!src/**
+!scripts/
+!scripts/**
+!tests/
+!tests/**
+
 # Keep essential config templates and examples
 !requirements.txt
 !setup.py
@@ -441,7 +454,6 @@ temporary/
 !CHANGELOG.md
 !docs/
 !examples/
-!tests/
 
 # Keep small example models/data for testing (if any)
 !examples/models/small_*.pt
