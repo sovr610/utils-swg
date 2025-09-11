@@ -168,7 +168,19 @@ pip install ninja tensorboard rich psutil
 ```bash
 git clone <repository-url>
 cd ssn-cfc
+
+# Verify the installation (recommended after cloning)
+python verify_setup.py
+
+# Create and activate virtual environment
+python -m venv nn
+source nn/bin/activate  # On Windows: nn\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Test the installation
+python scripts/cli.py info --system
 ```
 
 ## 📚 Usage Guide
