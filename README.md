@@ -172,11 +172,13 @@ cd ssn-cfc
 # Verify the installation (recommended after cloning)
 python verify_setup.py
 
-# Create and activate virtual environment
+# Option 1: Automated installation (recommended)
+chmod +x install_dependencies.sh
+./install_dependencies.sh
+
+# Option 2: Manual installation
 python -m venv nn
 source nn/bin/activate  # On Windows: nn\Scripts\activate
-
-# Install dependencies
 pip install -r requirements.txt
 
 # Test the installation
@@ -514,10 +516,28 @@ pip install transformers datasets
 pip install numpy pandas matplotlib tqdm rich
 
 # Install robotics-specific dependencies
-pip install scipy opencv-python h5py
+pip install scipy opencv-python-headless h5py
 
 # Install optional performance packages
 pip install ninja tensorboard psutil
+```
+
+**OpenCV Installation Issues (Docker/Server environments):**
+
+```bash
+# Try headless version first (recommended for servers)
+pip install opencv-python-headless>=4.5.0
+
+# If that fails, try standard version
+pip install opencv-python>=4.5.0
+
+# For Ubuntu/Debian systems, install system dependencies
+sudo apt-get update
+sudo apt-get install libgl1-mesa-glx libglib2.0-0
+
+# Use automated installer script
+chmod +x install_dependencies.sh
+./install_dependencies.sh
 ```
 
 **CUDA/GPU Issues:**

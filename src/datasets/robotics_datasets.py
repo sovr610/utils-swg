@@ -21,10 +21,27 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List, Union
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 import pickle
-import cv2
 from collections import defaultdict
 
+# Optional OpenCV import with fallback
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    cv2 = None
+    HAS_OPENCV = False
+    logging.warning("OpenCV not available. Some robotics vision features will be disabled.")
+
 logger = logging.getLogger(__name__)
+
+def check_opencv_available():
+    """Check if OpenCV is available and provide helpful error message if not."""
+    if not HAS_OPENCV:
+        raise ImportError(
+            "OpenCV is required for robotics datasets but not available. "
+            "Please install it with: pip install opencv-python-headless"
+        )
+    return True
 
 class RoboticsDatasetConfig:
     """Configuration for robotics dataset creation."""

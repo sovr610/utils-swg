@@ -25,7 +25,7 @@ tqdm>=4.65.0
 
 # Scientific computing and data processing
 scipy>=1.7.0
-opencv-python>=4.5.0
+opencv-python-headless>=4.5.0  # Headless version for better Docker/server compatibility
 h5py>=3.1.0
 requests>=2.25.0
 
