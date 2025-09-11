@@ -1,0 +1,34 @@
+# Requirements for Liquid-Spiking Neural Network CLI
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+snntorch==0.9.1
+ncps>=0.0.1
+
+# Text processing for LLM
+transformers>=4.35.0
+tokenizers>=0.14.0
+datasets>=2.14.0
+sentencepiece>=0.1.99
+
+# CLI interface
+rich>=13.0.0
+click>=8.0.0
+argparse
+
+# Visualization and data handling
+matplotlib>=3.5.0
+Pillow>=8.0.0
+tqdm>=4.65.0
+
+# Development and export
+tensorboard>=2.8.0
+onnx>=1.12.0
+
+# Optional performance improvements
+ninja  # For custom CUDA kernels
+
+# System utilities
+psutil>=5.8.0  # For system monitoring
