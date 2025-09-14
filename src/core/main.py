@@ -19,6 +19,22 @@ from dataclasses import dataclass
 import math
 from collections import OrderedDict
 import torchvision
+
+# Import memory management utilities
+try:
+    from ..utils.memory_manager import (
+        get_memory_manager, SpikingMemoryManager, memory_scope, 
+        safe_zeros, safe_stack, cleanup_memory, log_memory
+    )
+except ImportError:
+    # Fallback for relative imports
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils.memory_manager import (
+        get_memory_manager, SpikingMemoryManager, memory_scope, 
+        safe_zeros, safe_stack, cleanup_memory, log_memory
+    )
 import torchvision.transforms as transforms
 from torch.amp import autocast
 from torch.amp import GradScaler
@@ -228,25 +244,34 @@ class SpikingEncoder(nn.Module):
         
     def forward(self, x):
         batch_size = x.shape[0]
+        feature_dim = x.shape[-1]
+        
         if len(x.shape) == 2:
             x = x.unsqueeze(1).repeat(1, self.num_steps, 1)
         
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         
-        spk_recordings = []
+        # Use memory manager for safe tensor allocation
+        output_dim = self.fc2.out_features
+        spike_output = safe_zeros((batch_size, self.num_steps, output_dim), 
+                                 device=x.device, dtype=x.dtype)
+        
+        # Create zero tensor once for reuse
+        zero_input = safe_zeros((batch_size, feature_dim), device=x.device, dtype=x.dtype)
+        
         for step in range(self.num_steps):
             if step < x.shape[1]:
                 cur1 = self.fc1(x[:, step, :])
             else:
-                cur1 = self.fc1(torch.zeros_like(x[:, 0, :]))
+                cur1 = self.fc1(zero_input)
             spk1, mem1 = self.lif1(cur1, mem1)
             spk1 = self.dropout(spk1)
             cur2 = self.fc2(spk1)
             spk2, mem2 = self.lif2(cur2, mem2)
-            spk_recordings.append(spk2)
+            spike_output[:, step, :] = spk2
         
-        return torch.stack(spk_recordings, dim=1)
+        return spike_output
 
 class LiquidCell(nn.Module):
     def __init__(self, input_dim, units, backbone='cfc'):
@@ -302,11 +327,15 @@ class HybridLiquidSpikingBlock(nn.Module):
         self.output_dim = input_dim  # Match input dimension for residuals
         
     def forward(self, x, h=None):
-        # Handle sequence input for LLM
+        # Handle sequence input for LLM with improved memory management
         if len(x.shape) == 3:  # [batch, seq_len, features]
             batch_size, seq_len, features = x.shape
+            
+            # Use memory manager for safe tensor allocation
+            output_tensor = safe_zeros((batch_size, seq_len, self.output_dim), 
+                                      device=x.device, dtype=x.dtype)
+            
             # Process each timestep
-            outputs = []
             for t in range(seq_len):
                 token_input = x[:, t:t+1, :]  # [batch, 1, features]
                 spike_out = self.spike_encoder(token_input)
@@ -316,10 +345,9 @@ class HybridLiquidSpikingBlock(nn.Module):
                     liquid_out = liquid_out.squeeze(1)  # Remove seq dim if present
                 combined = torch.cat([liquid_out, spike_features], dim=-1)
                 output = self.fusion(combined)
-                outputs.append(output.unsqueeze(1))  # Add seq dim back
+                output_tensor[:, t, :] = output.squeeze(1) if output.dim() > 2 else output
             
-            final_output = torch.cat(outputs, dim=1)  # [batch, seq_len, output_dim]
-            return final_output, h
+            return output_tensor, h
         else:
             # Original processing for non-sequence input
             spike_out = self.spike_encoder(x)
@@ -363,23 +391,33 @@ class MultiHeadSpikingAttention(nn.Module):
         k_mem = self.k_lif.init_leaky()
         v_mem = self.v_lif.init_leaky()
         
-        q_spikes = []
-        k_spikes = []
-        v_spikes = []
+        # Use memory manager for safe spike accumulator allocation
+        q_spike_accumulator = safe_zeros((self.spike_steps, batch_size, self.num_heads, seq_len, self.head_dim), 
+                                        device=x.device, dtype=x.dtype)
+        k_spike_accumulator = safe_zeros((self.spike_steps, batch_size, self.num_heads, seq_len, self.head_dim), 
+                                        device=x.device, dtype=x.dtype)
+        v_spike_accumulator = safe_zeros((self.spike_steps, batch_size, self.num_heads, seq_len, self.head_dim), 
+                                        device=x.device, dtype=x.dtype)
         
-        for _ in range(self.spike_steps):
-            q_spk, q_mem = self.q_lif(q.reshape(-1, self.head_dim), q_mem)
-            k_spk, k_mem = self.k_lif(k.reshape(-1, self.head_dim), k_mem)
-            v_spk, v_mem = self.v_lif(v.reshape(-1, self.head_dim), v_mem)
+        q_reshaped = q.reshape(-1, self.head_dim)
+        k_reshaped = k.reshape(-1, self.head_dim)
+        v_reshaped = v.reshape(-1, self.head_dim)
+        
+        for step in range(self.spike_steps):
+            q_spk, q_mem = self.q_lif(q_reshaped, q_mem)
+            k_spk, k_mem = self.k_lif(k_reshaped, k_mem)
+            v_spk, v_mem = self.v_lif(v_reshaped, v_mem)
             
-            q_spikes.append(q_spk.view(batch_size, self.num_heads, seq_len, self.head_dim))
-            k_spikes.append(k_spk.view(batch_size, self.num_heads, seq_len, self.head_dim))
-            v_spikes.append(v_spk.view(batch_size, self.num_heads, seq_len, self.head_dim))
+            q_spike_accumulator[step] = q_spk.view(batch_size, self.num_heads, seq_len, self.head_dim)
+            k_spike_accumulator[step] = k_spk.view(batch_size, self.num_heads, seq_len, self.head_dim)
+            v_spike_accumulator[step] = v_spk.view(batch_size, self.num_heads, seq_len, self.head_dim)
         
-        q_agg = torch.stack(q_spikes).mean(0)
-        k_agg = torch.stack(k_spikes).mean(0)
-        v_agg = torch.stack(v_spikes).mean(0)
+        # Use mean instead of stack to reduce memory usage
+        q_agg = q_spike_accumulator.mean(0)
+        k_agg = k_spike_accumulator.mean(0)
+        v_agg = v_spike_accumulator.mean(0)
         
+        # Compute attention scores
         scores = torch.matmul(q_agg, k_agg.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v_agg)
@@ -719,6 +757,16 @@ class LiquidSpikingTrainer:
         self.is_main_process = self.multi_gpu_manager.should_save_checkpoint()
         self.world_size = len(self.gpu_ids) if self.gpu_ids else 1
         
+        # Initialize memory manager for leak prevention
+        self.memory_manager = SpikingMemoryManager(
+            cleanup_threshold_mb=1000.0,  # 1GB threshold
+            auto_cleanup=True,
+            max_spike_steps=getattr(config, 'num_spike_steps', 32)  # Default to 32 if not set
+        )
+        
+        # Log initial memory state
+        self.memory_manager.log_memory_usage("Trainer initialization")
+    
     def _init_ema(self):
         """Initialize Exponential Moving Average of model parameters."""
         self.ema_model = {}
@@ -727,11 +775,17 @@ class LiquidSpikingTrainer:
                 self.ema_model[name] = param.data.clone()
     
     def _update_ema(self):
-        """Update EMA parameters."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.ema_model:
-                self.ema_model[name] = (self.ema_decay * self.ema_model[name] + 
-                                       (1 - self.ema_decay) * param.data)
+        """Update EMA parameters with memory leak prevention."""
+        if not hasattr(self, 'ema_model') or self.ema_model is None:
+            return
+            
+        with torch.no_grad():  # Prevent gradient tracking for memory efficiency
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and name in self.ema_model:
+                    # In-place update to prevent memory accumulation
+                    self.ema_model[name].mul_(self.ema_decay).add_(
+                        param.data, alpha=(1 - self.ema_decay)
+                    )
         
     def train_epoch(self, train_loader):
         self.model.train()
@@ -745,6 +799,9 @@ class LiquidSpikingTrainer:
         
         # Reset gradient accumulation
         accumulated_loss = 0
+        
+        # Memory leak prevention: Track and clear GPU memory periodically
+        memory_cleanup_interval = 50  # Clean memory every 50 batches
         
         for batch_idx, batch in enumerate(progress_bar):
             # Handle different batch formats
@@ -821,6 +878,53 @@ class LiquidSpikingTrainer:
                     accumulated_loss = 0
                     num_batches += 1
             
+            # Memory cleanup to prevent leaks
+            if batch_idx % memory_cleanup_interval == 0 and batch_idx > 0:
+                # Use memory manager for cleanup
+                self.memory_manager.cleanup_memory()
+                # Explicit cleanup of intermediate tensors
+                del data, targets, outputs, loss
+                    
+            # Update progress bar with detailed metrics (only on main process)
+            if show_progress and hasattr(progress_bar, 'set_postfix') and num_batches > 0:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                avg_grad_norm = gradient_norm_sum / num_batches if num_batches > 0 else 0
+                progress_bar.set_postfix({
+                    'loss': f'{total_loss/num_batches:.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'grad_norm': f'{avg_grad_norm:.3f}',
+                    'gpus': len(self.gpu_ids) if self.gpu_ids else 0
+                })
+        
+        # Handle remaining accumulated gradients
+        if accumulated_loss > 0:
+            if self.config.gradient_clip > 0:
+                if self.scaler:
+                    self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.gradient_clip
+                )
+                gradient_norm_sum += grad_norm.item()
+            
+            if self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            self._update_ema()
+            total_loss += accumulated_loss
+            num_batches += 1
+            
+            # Memory cleanup to prevent leaks
+            if batch_idx % memory_cleanup_interval == 0 and batch_idx > 0:
+                # Explicit cleanup of intermediate tensors
+                del data, targets, outputs, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
             # Update progress bar with detailed metrics (only on main process)
             if show_progress and hasattr(progress_bar, 'set_postfix') and num_batches > 0:
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -867,6 +971,10 @@ class LiquidSpikingTrainer:
         
         self.train_losses.append(avg_loss)
         self.learning_rates.append(self.optimizer.param_groups[0]['lr'])
+        
+        # End-of-epoch memory cleanup
+        self.memory_manager.cleanup_memory()
+        self.memory_manager.log_memory_usage("End of training epoch")
         
         return avg_loss, avg_grad_norm
     

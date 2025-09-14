@@ -28,6 +28,7 @@ from datetime import datetime
 import platform
 import psutil
 import subprocess
+import logging
 
 # Rich imports for beautiful CLI
 from rich.console import Console
@@ -48,6 +49,8 @@ from rich.columns import Columns
 from rich.markdown import Markdown
 from rich import print as rprint
 from rich.status import Status
+from rich.logging import RichHandler
+from contextlib import contextmanager
 
 # Import from main.py
 # Add parent directory to path for imports
@@ -59,11 +62,72 @@ from src.core.main import (
     create_custom_config, save_config, load_config, print_config_summary,
     get_model_parameter_count, load_model, benchmark_model, export_onnx, 
     generate_text, evaluate_perplexity, train_llm_model, train_vision_model, 
-    train_robotics_model
+    train_robotics_model, inference_example
 )
 
 # Initialize Rich console
 console = Console()
+
+def setup_logging():
+    """Configure logging to work properly with Rich console."""
+    # Create Rich handler for logging
+    rich_handler = RichHandler(
+        console=console,
+        show_time=False,
+        show_path=False,
+        show_level=False,
+        markup=True,
+        rich_tracebacks=True
+    )
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=logging.WARNING,  # Only show warnings and errors by default
+        format="%(message)s",
+        handlers=[rich_handler]
+    )
+    
+    # Set specific loggers to appropriate levels
+    logging.getLogger("src.core.main").setLevel(logging.WARNING)
+    logging.getLogger("src.utils.gpu_utils").setLevel(logging.WARNING)
+    logging.getLogger("src.utils.memory_manager").setLevel(logging.WARNING)
+    logging.getLogger("src.datasets").setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("datasets").setLevel(logging.ERROR)
+    
+def enable_verbose_logging():
+    """Enable verbose logging for debugging."""
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("src.core.main").setLevel(logging.INFO)
+    logging.getLogger("src.utils.gpu_utils").setLevel(logging.INFO)
+    logging.getLogger("src.utils.memory_manager").setLevel(logging.INFO)
+
+@contextmanager
+def suppress_logging(level=logging.ERROR):
+    """Context manager to temporarily suppress logging during status displays."""
+    old_levels = {}
+    loggers_to_suppress = [
+        "",  # root logger
+        "src.core.main",
+        "src.utils.gpu_utils", 
+        "src.utils.memory_manager",
+        "src.datasets",
+        "transformers",
+        "datasets"
+    ]
+    
+    # Save old levels and set new ones
+    for logger_name in loggers_to_suppress:
+        logger = logging.getLogger(logger_name)
+        old_levels[logger_name] = logger.level
+        logger.setLevel(level)
+    
+    try:
+        yield
+    finally:
+        # Restore old levels
+        for logger_name, old_level in old_levels.items():
+            logging.getLogger(logger_name).setLevel(old_level)
 
 class RichLogger:
     """Enhanced logger using Rich for beautiful output."""
@@ -150,6 +214,9 @@ class LiquidSpikingCLI:
     """Enhanced CLI application with Rich graphics."""
     
     def __init__(self):
+        # Setup logging first
+        setup_logging()
+        
         self.parser = self._create_parser()
         self.logger = RichLogger()
         self.console = console
@@ -326,6 +393,11 @@ class LiquidSpikingCLI:
                               help='Use synchronized batch normalization for distributed training')
         gpu_group.add_argument('--no-sync-batchnorm', action='store_false', dest='sync_batchnorm',
                               help='Disable synchronized batch normalization')
+        
+        # Debug and output options
+        debug_group = train_parser.add_argument_group('Debug and Output')
+        debug_group.add_argument('--verbose', action='store_true',
+                               help='Enable verbose logging output')
     
     def _add_inference_parser(self, subparsers):
         """Add inference subcommand parser."""
@@ -468,6 +540,10 @@ class LiquidSpikingCLI:
     
     def _handle_train(self, args):
         """Handle the train command with rich progress display and multi-GPU support."""
+        # Configure logging based on verbose flag
+        if getattr(args, 'verbose', False):
+            enable_verbose_logging()
+        
         self.logger.header("Training Neural Network", f"Task: {args.task.upper()}")
         
         # Display GPU information if multi-GPU is enabled
@@ -486,15 +562,17 @@ class LiquidSpikingCLI:
         
         # Create datasets with progress
         with Status("[bold green]Creating datasets...", spinner="dots"):
-            train_dataset, val_dataset = self._create_datasets(config, args)
+            with suppress_logging():
+                train_dataset, val_dataset = self._create_datasets(config, args)
         
         # Create data loaders
         train_loader, val_loader = self._create_data_loaders(config, args, train_dataset, val_dataset)
         
         # Initialize model and trainer
         with Status("[bold green]Initializing model and multi-GPU setup...", spinner="dots"):
-            model = LiquidSpikingNetwork(config)
-            trainer = LiquidSpikingTrainer(model, config)
+            with suppress_logging():
+                model = LiquidSpikingNetwork(config)
+                trainer = LiquidSpikingTrainer(model, config)
         
         # Display model information
         self._display_model_info(model)
@@ -552,13 +630,14 @@ class LiquidSpikingCLI:
                 val_loss = None
                 if val_loader is not None:
                     with Status("[yellow]Running validation...", spinner="dots"):
-                        is_best = trainer.validate(val_loader)
-                        val_loss = trainer.val_losses[-1]
-                        
-                        if is_best:
-                            best_path = output_dir / f"{args.task}_best_model.pt"
-                            trainer.save_checkpoint(str(best_path))
-                            self.logger.success(f"New best model saved: {best_path}")
+                        with suppress_logging():
+                            is_best = trainer.validate(val_loader)
+                            val_loss = trainer.val_losses[-1]
+                            
+                            if is_best:
+                                best_path = output_dir / f"{args.task}_best_model.pt"
+                                trainer.save_checkpoint(str(best_path))
+                                self.logger.success(f"New best model saved: {best_path}")
                 
                 epoch_time = time.time() - epoch_start
                 
@@ -658,7 +737,8 @@ class LiquidSpikingCLI:
         
         # Load model
         with Status("[bold green]Loading model...", spinner="dots"):
-            model, config = load_model(args.model_path, None)
+            with suppress_logging():
+                model, config = load_model(args.model_path, None)
         
         batch_sizes = list(map(int, args.batch_sizes.split(',')))
         results = {}
@@ -830,15 +910,16 @@ class LiquidSpikingCLI:
         sys_table.add_row("Python", system_info['python_version'])
         sys_table.add_row("PyTorch", system_info['pytorch_version'])
         sys_table.add_row("CPU Cores", str(system_info['cpu_count']))
-        sys_table.add_row("RAM", f"{system_info['memory_gb']:.1f} GB")
+        sys_table.add_row("RAM", f"{system_info['memory_total'] / (1024**3):.1f} GB")
         
         # Dependencies table
         deps_table = Table(title="📦 Key Dependencies", show_header=False)
         deps_table.add_column("Package", style="green")
         deps_table.add_column("Version", style="white")
         
-        for pkg, version in system_info['dependencies'].items():
-            deps_table.add_row(pkg, version)
+        deps_table.add_row("PyTorch", system_info['pytorch_version'])
+        deps_table.add_row("snnTorch", system_info['snntorch_version'])
+        deps_table.add_row("NCPS", system_info['ncps_version'])
         
         # CUDA/GPU table
         if system_info['cuda_available']:
@@ -847,10 +928,11 @@ class LiquidSpikingCLI:
             cuda_table.add_column("Value", style="white")
             
             cuda_table.add_row("CUDA Available", "✅ Yes")
-            cuda_table.add_row("CUDA Version", system_info['cuda_version'])
-            cuda_table.add_row("GPU Count", str(system_info['gpu_count']))
-            cuda_table.add_row("Primary GPU", system_info['gpu_name'])
-            cuda_table.add_row("GPU Memory", f"{system_info['gpu_memory_gb']:.1f} GB")
+            cuda_table.add_row("CUDA Version", system_info.get('cuda_version', 'Unknown'))
+            cuda_table.add_row("GPU Count", str(system_info.get('cuda_device_count', 0)))
+            cuda_table.add_row("Primary GPU", system_info.get('cuda_device_name', 'Unknown'))
+            cuda_memory_gb = system_info.get('cuda_memory_total', 0) / (1024**3) if system_info.get('cuda_memory_total') else 0
+            cuda_table.add_row("GPU Memory", f"{cuda_memory_gb:.1f} GB")
             
             console.print(Columns([sys_table, deps_table, cuda_table]))
         else:
@@ -863,8 +945,9 @@ class LiquidSpikingCLI:
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from src.utils.gpu_utils import GPUDetector
         
-        # Get GPU information
-        gpus = GPUDetector.detect_gpus()
+        # Get GPU information with logging suppressed
+        with suppress_logging():
+            gpus = GPUDetector.detect_gpus()
         
         if not gpus:
             console.print("🚫 [red]No GPUs detected or CUDA unavailable[/red]")
@@ -1221,16 +1304,18 @@ class LiquidSpikingCLI:
         
         # Load model
         with Status("[bold green]Loading model...", spinner="dots"):
-            model, config = load_model(args.model_path, None)
+            with suppress_logging():
+                model, config = load_model(args.model_path, None)
         
         # Prepare input data
         input_data = self._prepare_input_data(args, config)
         
         # Run inference
         with Status("[bold green]Running inference...", spinner="dots"):
-            start_time = time.time()
-            predictions = inference_example(model, config, input_data)
-            inference_time = time.time() - start_time
+            with suppress_logging():
+                start_time = time.time()
+                predictions = inference_example(model, config, input_data)
+                inference_time = time.time() - start_time
         
         # Display results
         self._display_inference_results(input_data, predictions, inference_time, args)
@@ -1298,14 +1383,16 @@ class LiquidSpikingCLI:
         
         # Load model
         with Status("[bold green]Loading model...", spinner="dots"):
-            model, config = load_model(args.model_path, None)
+            with suppress_logging():
+                model, config = load_model(args.model_path, None)
         
         # Export model
         with Status(f"[bold green]Exporting to {args.format}...", spinner="dots"):
-            if args.format == 'onnx':
-                export_onnx(model, config, args.output_path)
-            elif args.format == 'torchscript':
-                self._export_torchscript(model, config, args.output_path)
+            with suppress_logging():
+                if args.format == 'onnx':
+                    export_onnx(model, config, args.output_path)
+                elif args.format == 'torchscript':
+                    self._export_torchscript(model, config, args.output_path)
         
         self.logger.success(f"Model exported successfully to {args.output_path}")
     
