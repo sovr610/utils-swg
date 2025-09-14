@@ -29,8 +29,13 @@
   "mixed_precision": true,
   "device": "cuda",
   "seed": 42,
-  "num_epochs": 3,
+  "num_epochs": 15,
   "layer_norm_eps": 1e-05,
   "initializer_range": 0.02,
-  "use_cache": true
+  "use_cache": true,
+  "multi_gpu_strategy": "auto",
+  "gpu_ids": null,
+  "distributed_backend": "nccl",
+  "sync_batchnorm": true,
+  "find_unused_parameters": false
 }

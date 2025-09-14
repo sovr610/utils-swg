@@ -164,6 +164,15 @@ class LiquidSpikingCLI:
   [green]# Train a vision model for 20 epochs[/green]
   python cli.py train --task vision --epochs 20 --batch-size 64
   
+  [green]# Train with multi-GPU acceleration (auto-detect GPUs)[/green]
+  python cli.py train --task llm --epochs 15 --multi-gpu
+  
+  [green]# Train with specific GPUs using DataParallel[/green]
+  python cli.py train --task vision --gpu-strategy dp --gpu-ids "0,1,2"
+  
+  [green]# Train with DistributedDataParallel (recommended for 4+ GPUs)[/green]
+  python cli.py train --task robotics --gpu-strategy ddp --multi-gpu
+  
   [green]# Load and run inference on an image[/green]
   python cli.py inference --model-path vision_model.pt --input-file test.npy
   
@@ -175,6 +184,9 @@ class LiquidSpikingCLI:
   
   [green]# Interactive configuration editor[/green]
   python cli.py config --task robotics --interactive
+  
+  [green]# Check system and GPU information[/green]
+  python cli.py info --system --gpu
             """
         )
         
@@ -289,10 +301,31 @@ class LiquidSpikingCLI:
                                 help='Skip validation during training')
         train_parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='auto',
                                 help='Device to use for training (default: auto)')
-        train_parser.add_argument('--mixed-precision', action='store_true',
-                                help='Enable mixed precision training')
+        train_parser.add_argument('--mixed-precision', dest='mixed_precision', action='store_true', default=True,
+                                help='Enable mixed precision training (default: True)')
+        train_parser.add_argument('--no-mixed-precision', dest='mixed_precision', action='store_false',
+                                help='Disable mixed precision training')
         train_parser.add_argument('--seed', type=int, default=42,
                                 help='Random seed for reproducibility')
+        
+        # Multi-GPU training options
+        gpu_group = train_parser.add_argument_group('Multi-GPU Training')
+        gpu_group.add_argument('--multi-gpu', action='store_true',
+                              help='Enable multi-GPU training (auto-detect available GPUs)')
+        gpu_group.add_argument('--gpu-strategy', choices=['auto', 'dp', 'ddp', 'none'], 
+                              default='auto',
+                              help='Multi-GPU strategy: auto (automatic), dp (DataParallel), ddp (DistributedDataParallel), none (single GPU/CPU)')
+        gpu_group.add_argument('--gpu-ids', type=str,
+                              help='Specific GPU IDs to use (comma-separated, e.g., "0,1,2,3")')
+        gpu_group.add_argument('--distributed-backend', choices=['nccl', 'gloo'], 
+                              default='nccl',
+                              help='Distributed training backend (nccl for GPU, gloo for CPU)')
+        gpu_group.add_argument('--master-port', type=str, default='12355',
+                              help='Port for distributed training communication (default: 12355)')
+        gpu_group.add_argument('--sync-batchnorm', action='store_true', default=True,
+                              help='Use synchronized batch normalization for distributed training')
+        gpu_group.add_argument('--no-sync-batchnorm', action='store_false', dest='sync_batchnorm',
+                              help='Disable synchronized batch normalization')
     
     def _add_inference_parser(self, subparsers):
         """Add inference subcommand parser."""
@@ -355,6 +388,8 @@ class LiquidSpikingCLI:
                                help='Path to model checkpoint to analyze')
         info_parser.add_argument('--system', action='store_true',
                                help='Display system information')
+        info_parser.add_argument('--gpu', action='store_true',
+                               help='Display detailed GPU information for multi-GPU training')
         info_parser.add_argument('--config-only', action='store_true',
                                help='Display only configuration information')
     
@@ -432,8 +467,12 @@ class LiquidSpikingCLI:
         console.print("[dim]Example: python cli.py train --help[/dim]\n")
     
     def _handle_train(self, args):
-        """Handle the train command with rich progress display."""
+        """Handle the train command with rich progress display and multi-GPU support."""
         self.logger.header("Training Neural Network", f"Task: {args.task.upper()}")
+        
+        # Display GPU information if multi-GPU is enabled
+        if hasattr(args, 'multi_gpu') and (args.multi_gpu or args.gpu_strategy != 'none'):
+            self._display_gpu_info()
         
         # Create output directory
         output_dir = Path(args.output_dir)
@@ -453,12 +492,16 @@ class LiquidSpikingCLI:
         train_loader, val_loader = self._create_data_loaders(config, args, train_dataset, val_dataset)
         
         # Initialize model and trainer
-        with Status("[bold green]Initializing model...", spinner="dots"):
+        with Status("[bold green]Initializing model and multi-GPU setup...", spinner="dots"):
             model = LiquidSpikingNetwork(config)
             trainer = LiquidSpikingTrainer(model, config)
         
         # Display model information
         self._display_model_info(model)
+        
+        # Display multi-GPU training info
+        if hasattr(trainer, 'gpu_ids') and trainer.gpu_ids and len(trainer.gpu_ids) > 1:
+            self._display_multi_gpu_info(trainer)
         
         # Training loop with rich progress bar
         self._train_with_progress(trainer, train_loader, val_loader, args, output_dir)
@@ -679,6 +722,9 @@ class LiquidSpikingCLI:
         if args.system or not args.model_path:
             self._display_system_info()
         
+        if args.gpu:
+            self._display_gpu_info()
+        
         if args.model_path:
             self._display_model_info_detailed(args.model_path, args.config_only)
     
@@ -772,6 +818,129 @@ class LiquidSpikingCLI:
         console.print(table)
     
     def _display_system_info(self):
+        """Display comprehensive system information including GPU details."""
+        system_info = SystemInfo.get_system_info()
+        
+        # System table
+        sys_table = Table(title="🖥️ System Information", show_header=False)
+        sys_table.add_column("Property", style="cyan")
+        sys_table.add_column("Value", style="white")
+        
+        sys_table.add_row("Platform", system_info['platform'])
+        sys_table.add_row("Python", system_info['python_version'])
+        sys_table.add_row("PyTorch", system_info['pytorch_version'])
+        sys_table.add_row("CPU Cores", str(system_info['cpu_count']))
+        sys_table.add_row("RAM", f"{system_info['memory_gb']:.1f} GB")
+        
+        # Dependencies table
+        deps_table = Table(title="📦 Key Dependencies", show_header=False)
+        deps_table.add_column("Package", style="green")
+        deps_table.add_column("Version", style="white")
+        
+        for pkg, version in system_info['dependencies'].items():
+            deps_table.add_row(pkg, version)
+        
+        # CUDA/GPU table
+        if system_info['cuda_available']:
+            cuda_table = Table(title="🔥 CUDA/GPU Information", show_header=False)
+            cuda_table.add_column("Property", style="yellow")
+            cuda_table.add_column("Value", style="white")
+            
+            cuda_table.add_row("CUDA Available", "✅ Yes")
+            cuda_table.add_row("CUDA Version", system_info['cuda_version'])
+            cuda_table.add_row("GPU Count", str(system_info['gpu_count']))
+            cuda_table.add_row("Primary GPU", system_info['gpu_name'])
+            cuda_table.add_row("GPU Memory", f"{system_info['gpu_memory_gb']:.1f} GB")
+            
+            console.print(Columns([sys_table, deps_table, cuda_table]))
+        else:
+            console.print(Columns([sys_table, deps_table]))
+    
+    def _display_gpu_info(self):
+        """Display detailed GPU information for multi-GPU training."""
+        # Import GPU utils
+        import sys
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from src.utils.gpu_utils import GPUDetector
+        
+        # Get GPU information
+        gpus = GPUDetector.detect_gpus()
+        
+        if not gpus:
+            console.print("🚫 [red]No GPUs detected or CUDA unavailable[/red]")
+            return
+        
+        # Create GPU table
+        gpu_table = Table(title="🔥 Available GPUs for Multi-GPU Training")
+        gpu_table.add_column("ID", justify="center")
+        gpu_table.add_column("Name", style="cyan")
+        gpu_table.add_column("Memory", justify="right")
+        gpu_table.add_column("Compute", justify="center")
+        gpu_table.add_column("Status", justify="center")
+        gpu_table.add_column("Temp", justify="right")
+        gpu_table.add_column("Power", justify="right")
+        
+        for gpu in gpus:
+            status = "✅" if gpu.is_available else "❌"
+            memory = f"{gpu.memory_total / 1024:.1f} GB"
+            compute = f"{gpu.compute_capability[0]}.{gpu.compute_capability[1]}"
+            temp = f"{gpu.temperature}°C" if gpu.temperature else "N/A"
+            power = f"{gpu.power_usage}W" if gpu.power_usage else "N/A"
+            
+            gpu_table.add_row(
+                str(gpu.device_id),
+                gpu.name,
+                memory,
+                compute,
+                status,
+                temp,
+                power
+            )
+        
+        console.print(gpu_table)
+        
+        # Show compatible GPUs
+        compatible_gpus = GPUDetector.filter_compatible_gpus(gpus)
+        if compatible_gpus:
+            console.print(f"\n✅ [green]{len(compatible_gpus)} GPU(s) available for training[/green]")
+            gpu_ids = [str(gpu.device_id) for gpu in compatible_gpus]
+            console.print(f"   GPU IDs: {', '.join(gpu_ids)}")
+        else:
+            console.print("\n⚠️ [yellow]No compatible GPUs found for training[/yellow]")
+    
+    def _display_multi_gpu_info(self, trainer):
+        """Display multi-GPU training configuration."""
+        if not hasattr(trainer, 'gpu_ids') or not trainer.gpu_ids:
+            return
+        
+        # Multi-GPU info table
+        gpu_info_table = Table(title="⚡ Multi-GPU Training Configuration")
+        gpu_info_table.add_column("Setting", style="cyan")
+        gpu_info_table.add_column("Value", style="white")
+        
+        strategy = getattr(trainer.config, 'multi_gpu_strategy', 'unknown')
+        gpu_count = len(trainer.gpu_ids)
+        gpu_ids_str = ', '.join(map(str, trainer.gpu_ids))
+        world_size = getattr(trainer, 'world_size', gpu_count)
+        
+        gpu_info_table.add_row("Strategy", strategy.upper())
+        gpu_info_table.add_row("GPU Count", str(gpu_count))
+        gpu_info_table.add_row("GPU IDs", gpu_ids_str)
+        gpu_info_table.add_row("World Size", str(world_size))
+        gpu_info_table.add_row("Batch Size", str(trainer.config.batch_size))
+        gpu_info_table.add_row("Distributed", "Yes" if trainer.multi_gpu_manager.is_distributed else "No")
+        
+        console.print(gpu_info_table)
+        
+        # Performance estimation
+        base_batch_size = 32  # Assume base batch size
+        speedup_estimate = min(gpu_count * 0.85, gpu_count)  # Account for overhead
+        
+        console.print(f"\n🚀 [green]Expected training speedup: ~{speedup_estimate:.1f}x[/green]")
+        console.print(f"   📊 Effective batch size: {trainer.config.batch_size}")
+        console.print(f"   🔥 Multi-GPU acceleration active!")
+    
+    def _display_system_info_old(self):
         """Display system information in a comprehensive table."""
         sys_info = SystemInfo.get_system_info()
         
@@ -898,6 +1067,20 @@ class LiquidSpikingCLI:
             overrides['device'] = args.device
         elif args.device == 'auto':
             overrides['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Multi-GPU parameters
+        if hasattr(args, 'multi_gpu') and args.multi_gpu:
+            overrides['multi_gpu_strategy'] = 'auto'
+        if hasattr(args, 'gpu_strategy') and args.gpu_strategy:
+            overrides['multi_gpu_strategy'] = args.gpu_strategy
+        if hasattr(args, 'gpu_ids') and args.gpu_ids:
+            # Parse comma-separated GPU IDs
+            gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(',')]
+            overrides['gpu_ids'] = gpu_ids
+        if hasattr(args, 'distributed_backend') and args.distributed_backend:
+            overrides['distributed_backend'] = args.distributed_backend
+        if hasattr(args, 'sync_batchnorm') and args.sync_batchnorm is not None:
+            overrides['sync_batchnorm'] = args.sync_batchnorm
         
         # Apply overrides using create_custom_config
         if overrides:

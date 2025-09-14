@@ -35,6 +35,14 @@ import requests
 import gzip
 import urllib.request
 
+# GPU utilities import
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.utils.gpu_utils import (
+    setup_multi_gpu_environment, MultiGPUTrainingManager, MultiGPUConfig,
+    MultiGPUStrategy, create_distributed_sampler
+)
+
 class TaskType(Enum):
     LLM = "llm"
     VISION = "vision"
@@ -99,6 +107,13 @@ class ModelConfig:
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
     use_cache: bool = True
+    
+    # Multi-GPU parameters - optional
+    multi_gpu_strategy: str = "auto"  # "auto", "dp", "ddp", "none"
+    gpu_ids: Optional[List[int]] = None  # None means use all available
+    distributed_backend: str = "nccl"  # "nccl" for GPU, "gloo" for CPU
+    sync_batchnorm: bool = True  # Use synchronized batch normalization
+    find_unused_parameters: bool = False  # For DDP unused parameter detection
     
     def __post_init__(self):
         """Set default values for optional parameters."""
@@ -188,7 +203,12 @@ class ModelConfig:
             'num_epochs': self.num_epochs,
             'layer_norm_eps': self.layer_norm_eps,
             'initializer_range': self.initializer_range,
-            'use_cache': self.use_cache
+            'use_cache': self.use_cache,
+            'multi_gpu_strategy': self.multi_gpu_strategy,
+            'gpu_ids': self.gpu_ids,
+            'distributed_backend': self.distributed_backend,
+            'sync_batchnorm': self.sync_batchnorm,
+            'find_unused_parameters': self.find_unused_parameters
         }
     
     @classmethod
@@ -580,8 +600,42 @@ class LiquidSpikingTrainer:
     def __init__(self, model, config: ModelConfig):
         self.model = model
         self.config = config
-        self.device = torch.device(config.device)
+        
+        # Setup multi-GPU training environment
+        self.multi_gpu_manager, device, self.gpu_ids = setup_multi_gpu_environment(
+            strategy=config.multi_gpu_strategy,
+            gpu_ids=config.gpu_ids
+        )
+        
+        # Override device from multi-GPU setup
+        self.device = torch.device(device)
+        self.config.device = device
+        
+        # Setup distributed training if needed
+        if self.multi_gpu_manager.is_distributed:
+            self.multi_gpu_manager.initialize_distributed_process_group()
+        
+        # Move model to device
         self.model.to(self.device)
+        
+        # Wrap model for multi-GPU training
+        if len(self.gpu_ids) > 1:
+            strategy = MultiGPUStrategy(config.multi_gpu_strategy)
+            if strategy == MultiGPUStrategy.AUTO:
+                strategy = self.multi_gpu_manager.config.strategy
+            
+            self.model = self.multi_gpu_manager.wrap_model_for_multi_gpu(
+                self.model, strategy, self.gpu_ids
+            )
+            
+            # Adjust batch size for multi-GPU
+            original_batch_size = config.batch_size
+            config.batch_size = self.multi_gpu_manager.adjust_batch_size_for_multi_gpu(
+                config.batch_size, len(self.gpu_ids)
+            )
+            
+            if config.batch_size != original_batch_size:
+                logging.info(f"Adjusted batch size from {original_batch_size} to {config.batch_size} for multi-GPU training")
         
         # Advanced optimizer with better parameter settings
         self.optimizer = optim.AdamW(
@@ -638,7 +692,7 @@ class LiquidSpikingTrainer:
         
         # Enhanced mixed precision with better settings
         self.scaler = GradScaler(
-            device='cuda' if self.config.device == 'cuda' else 'cpu',
+            device='cuda' if 'cuda' in self.config.device else 'cpu',
             init_scale=2**16,
             growth_factor=2.0,
             backoff_factor=0.5,
@@ -661,6 +715,10 @@ class LiquidSpikingTrainer:
         self.ema_model = None
         self._init_ema()
         
+        # Multi-GPU specific settings
+        self.is_main_process = self.multi_gpu_manager.should_save_checkpoint()
+        self.world_size = len(self.gpu_ids) if self.gpu_ids else 1
+        
     def _init_ema(self):
         """Initialize Exponential Moving Average of model parameters."""
         self.ema_model = {}
@@ -681,7 +739,9 @@ class LiquidSpikingTrainer:
         num_batches = 0
         gradient_norm_sum = 0
         
-        progress_bar = tqdm(train_loader, desc="Training") if hasattr(train_loader, '__len__') else train_loader
+        # Only show progress bar on main process for distributed training
+        show_progress = not self.multi_gpu_manager.is_distributed or self.is_main_process
+        progress_bar = tqdm(train_loader, desc="Training", disable=not show_progress) if hasattr(train_loader, '__len__') else train_loader
         
         # Reset gradient accumulation
         accumulated_loss = 0
@@ -761,14 +821,15 @@ class LiquidSpikingTrainer:
                     accumulated_loss = 0
                     num_batches += 1
             
-            # Update progress bar with detailed metrics
-            if hasattr(progress_bar, 'set_postfix') and num_batches > 0:
+            # Update progress bar with detailed metrics (only on main process)
+            if show_progress and hasattr(progress_bar, 'set_postfix') and num_batches > 0:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 avg_grad_norm = gradient_norm_sum / num_batches if num_batches > 0 else 0
                 progress_bar.set_postfix({
                     'loss': f'{total_loss/num_batches:.4f}',
                     'lr': f'{current_lr:.2e}',
-                    'grad_norm': f'{avg_grad_norm:.3f}'
+                    'grad_norm': f'{avg_grad_norm:.3f}',
+                    'gpus': len(self.gpu_ids) if self.gpu_ids else 0
                 })
         
         # Handle remaining accumulated gradients
@@ -795,6 +856,14 @@ class LiquidSpikingTrainer:
         
         avg_loss = total_loss / max(num_batches, 1)
         avg_grad_norm = gradient_norm_sum / max(num_batches, 1)
+        
+        # Aggregate metrics across all processes for distributed training
+        if self.multi_gpu_manager.is_distributed:
+            loss_tensor = torch.tensor(avg_loss, device=self.device)
+            grad_norm_tensor = torch.tensor(avg_grad_norm, device=self.device)
+            
+            avg_loss = self.multi_gpu_manager.all_reduce_tensor(loss_tensor).item()
+            avg_grad_norm = self.multi_gpu_manager.all_reduce_tensor(grad_norm_tensor).item()
         
         self.train_losses.append(avg_loss)
         self.learning_rates.append(self.optimizer.param_groups[0]['lr'])
@@ -835,7 +904,7 @@ class LiquidSpikingTrainer:
         return loss
     
     def validate(self, val_loader, use_ema=True):
-        """Enhanced validation with EMA model option."""
+        """Enhanced validation with EMA model option and distributed support."""
         # Temporarily apply EMA weights if requested
         original_state = None
         if use_ema and self.ema_model:
@@ -851,8 +920,11 @@ class LiquidSpikingTrainer:
         total_correct = 0
         total_samples = 0
         
+        # Only show progress on main process for distributed training
+        show_progress = not self.multi_gpu_manager.is_distributed or self.is_main_process
+        
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating"):
+            for batch in tqdm(val_loader, desc="Validating", disable=not show_progress):
                 # Handle different batch formats
                 if isinstance(batch, (list, tuple)) and len(batch) == 2:
                     data, targets = batch
@@ -875,33 +947,46 @@ class LiquidSpikingTrainer:
                 num_batches += 1
                 
                 # Calculate accuracy for classification tasks
-                if self.config.task_type in [TaskType.LLM, TaskType.VISION]:
+                if self.config.task_type in [TaskType.VISION, TaskType.LLM]:
                     if self.config.task_type == TaskType.LLM:
-                        # For LLM, reshape and ignore padding
+                        # For LLM, only count non-padding tokens
                         batch_size, seq_len, vocab_size = outputs.shape
                         outputs_flat = outputs.reshape(-1, vocab_size)
                         targets_flat = targets.reshape(-1)
-                        valid_indices = targets_flat != -100
                         
+                        valid_indices = targets_flat != -100
                         if valid_indices.any():
                             predictions = outputs_flat[valid_indices].argmax(dim=-1)
                             correct = (predictions == targets_flat[valid_indices]).sum().item()
                             total_correct += correct
                             total_samples += valid_indices.sum().item()
                     else:
-                        # Vision task
+                        # Vision classification
                         predictions = outputs.argmax(dim=-1)
-                        total_correct += (predictions == targets).sum().item()
+                        correct = (predictions == targets).sum().item()
+                        total_correct += correct
                         total_samples += targets.size(0)
+        
+        avg_loss = total_loss / max(num_batches, 1)
+        accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
+        
+        # Aggregate metrics across all processes for distributed training
+        if self.multi_gpu_manager.is_distributed:
+            loss_tensor = torch.tensor(avg_loss, device=self.device)
+            correct_tensor = torch.tensor(total_correct, device=self.device, dtype=torch.float)
+            samples_tensor = torch.tensor(total_samples, device=self.device, dtype=torch.float)
+            
+            avg_loss = self.multi_gpu_manager.all_reduce_tensor(loss_tensor).item()
+            total_correct = self.multi_gpu_manager.all_reduce_tensor(correct_tensor).item()
+            total_samples = self.multi_gpu_manager.all_reduce_tensor(samples_tensor).item()
+            
+            accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
         
         # Restore original weights if EMA was used
         if original_state:
             for name, param in self.model.named_parameters():
                 if name in original_state:
                     param.data.copy_(original_state[name])
-        
-        avg_loss = total_loss / max(num_batches, 1)
-        accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
         
         self.val_losses.append(avg_loss)
         
@@ -913,13 +998,90 @@ class LiquidSpikingTrainer:
         else:
             self.patience_counter += 1
         
-        return avg_loss, accuracy, is_best
+        return avg_loss, accuracy
     
     def train(self, train_loader, val_loader, num_epochs):
-        """Enhanced training loop with advanced features."""
+        """Enhanced training loop with multi-GPU support and advanced features."""
         self.total_epochs = num_epochs
         
-        print(f"\n🚀 Starting training for {num_epochs} epochs")
+        # Only print on main process for distributed training
+        if self.is_main_process:
+            print(f"\n🚀 Starting training for {num_epochs} epochs")
+            print(f"   💡 Using {len(self.gpu_ids) if self.gpu_ids else 0} GPUs")
+            print(f"   🎯 Strategy: {self.config.multi_gpu_strategy}")
+            print(f"   📦 Batch size: {self.config.batch_size}")
+            if len(self.gpu_ids) > 1:
+                print(f"   ⚡ Multi-GPU acceleration enabled!")
+        
+        start_time = time.time()
+        
+        for epoch in range(num_epochs):
+            epoch_start_time = time.time()
+            
+            # Set epoch for distributed sampler
+            if hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
+            
+            # Training phase
+            train_loss, grad_norm = self.train_epoch(train_loader)
+            
+            # Validation phase
+            val_loss, val_accuracy = self.validate(val_loader)
+            
+            # Learning rate scheduling
+            self.scheduler.step()
+            self.plateau_scheduler.step(val_loss)
+            
+            epoch_time = time.time() - epoch_start_time
+            
+            # Only log and save on main process
+            if self.is_main_process:
+                # Enhanced logging with multi-GPU info
+                gpu_info = f" (GPUs: {len(self.gpu_ids)})" if len(self.gpu_ids) > 1 else ""
+                print(f"Epoch {epoch+1}/{num_epochs}{gpu_info}:")
+                print(f"  🔥 Train Loss: {train_loss:.4f}")
+                print(f"  ✅ Val Loss: {val_loss:.4f}")
+                if val_accuracy > 0:
+                    print(f"  🎯 Val Accuracy: {val_accuracy:.2%}")
+                print(f"  📈 Grad Norm: {grad_norm:.3f}")
+                print(f"  ⏱️  Time: {epoch_time:.1f}s")
+                print(f"  📚 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+                
+                # Save checkpoint every 5 epochs or if best model
+                is_best = val_loss < self.best_val_loss
+                if is_best:
+                    self.best_val_loss = val_loss
+                    self.patience_counter = 0
+                    print(f"  🏆 New best model! Validation loss: {val_loss:.4f}")
+                else:
+                    self.patience_counter += 1
+                
+                if (epoch + 1) % 5 == 0 or is_best:
+                    checkpoint_name = f"checkpoint_epoch_{epoch+1}.pt"
+                    if is_best:
+                        checkpoint_name = "best_model.pt"
+                    self.save_checkpoint(checkpoint_name)
+                
+                # Early stopping check
+                if self.patience_counter >= self.max_patience:
+                    print(f"🛑 Early stopping triggered. No improvement for {self.max_patience} epochs.")
+                    break
+                
+                print("-" * 50)
+            
+            # Synchronize processes
+            if self.multi_gpu_manager.is_distributed:
+                self.multi_gpu_manager.barrier()
+        
+        # Final statistics (only on main process)
+        if self.is_main_process:
+            total_time = time.time() - start_time
+            print(f"\n🎊 Training completed!")
+            print(f"⏱️  Total time: {total_time/60:.1f} minutes")
+            print(f"📈 Best validation loss: {self.best_val_loss:.4f}")
+            print(f"🚀 Multi-GPU speedup achieved with {len(self.gpu_ids)} GPUs" if len(self.gpu_ids) > 1 else "")
+        
+        return self.train_losses, self.val_losses
         print(f"📊 Warmup epochs: {self.warmup_epochs}")
         print(f"📈 Gradient accumulation steps: {self.accumulation_steps}")
         print(f"🔧 Mixed precision: {self.config.mixed_precision}")
@@ -967,9 +1129,17 @@ class LiquidSpikingTrainer:
         return self.train_losses, self.val_losses
     
     def save_checkpoint(self, filename):
-        """Enhanced checkpoint saving with EMA and additional metrics."""
+        """Enhanced checkpoint saving with EMA and additional metrics (main process only)."""
+        if not self.is_main_process:
+            return  # Only save on main process for distributed training
+        
+        # Get the raw model state dict (unwrap from DDP/DP if needed)
+        model_state_dict = self.model.state_dict()
+        if hasattr(self.model, 'module'):
+            model_state_dict = self.model.module.state_dict()
+        
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_dict,
             'ema_model': self.ema_model if self.ema_model else None,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -983,10 +1153,14 @@ class LiquidSpikingTrainer:
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'epoch': len(self.train_losses),
             'accumulation_steps': self.accumulation_steps,
-            'ema_decay': self.ema_decay
+            'ema_decay': self.ema_decay,
+            'gpu_ids': self.gpu_ids,
+            'world_size': self.world_size
         }
         torch.save(checkpoint, filename)
-        print(f"📁 Enhanced checkpoint saved to {filename}")
+        print(f"📁 Enhanced multi-GPU checkpoint saved to {filename}")
+        if len(self.gpu_ids) > 1:
+            print(f"   🔧 Model unwrapped from {type(self.model).__name__} wrapper")
     
     def load_checkpoint(self, filename):
         """Enhanced checkpoint loading with backward compatibility."""
@@ -1026,9 +1200,21 @@ class LiquidSpikingTrainer:
         
         epoch = checkpoint.get('epoch', 0)
         print(f"📁 Enhanced checkpoint loaded from {filename} (epoch {epoch})")
-        if self.scaler and checkpoint['scaler_state_dict']:
+        if self.scaler and checkpoint.get('scaler_state_dict'):
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        print(f"Checkpoint loaded from {filename}")
+        
+        # Load multi-GPU information
+        self.gpu_ids = checkpoint.get('gpu_ids', self.gpu_ids)
+        self.world_size = checkpoint.get('world_size', self.world_size)
+        
+        print(f"📁 Enhanced multi-GPU checkpoint loaded from {filename} (epoch {epoch})")
+        if len(self.gpu_ids) > 1:
+            print(f"   🔧 Checkpoint saved from {checkpoint.get('world_size', 1)} GPU training")
+    
+    def cleanup(self):
+        """Clean up distributed training resources."""
+        if hasattr(self, 'multi_gpu_manager'):
+            self.multi_gpu_manager.cleanup_distributed()
 
 class TextDataset(Dataset):
     """Real text dataset for LLM training with proper tokenization."""
@@ -1660,8 +1846,31 @@ def get_model_parameter_count(config: ModelConfig) -> dict:
     
     return params
 
+def create_multi_gpu_data_loader(dataset, config, is_train=True, sampler=None):
+    """Create data loader with multi-GPU support."""
+    from src.utils.gpu_utils import create_distributed_sampler
+    
+    # Create distributed sampler if needed
+    if sampler is None:
+        sampler = create_distributed_sampler(dataset) if is_train else None
+    
+    # Adjust number of workers based on available CPUs and GPUs
+    num_workers = min(8, os.cpu_count() // max(1, len(config.gpu_ids or [1])))
+    
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=(is_train and sampler is None),  # Don't shuffle if using distributed sampler
+        sampler=sampler,
+        pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        drop_last=is_train,
+        prefetch_factor=2 if num_workers > 0 else None
+    )
+
 def train_llm_model():
-    """Train LLM with advanced optimizations and extensive programming + general language datasets."""
+    """Train LLM with advanced optimizations, extensive datasets, and multi-GPU support."""
     config = create_llm_config()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -1698,26 +1907,9 @@ def train_llm_model():
         tokenizer_name='gpt2'
     )
     
-    # Optimized data loaders for large datasets
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=8,  # More workers for massive dataset
-        persistent_workers=True,
-        drop_last=True,
-        prefetch_factor=4  # Prefetch more data
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        pin_memory=True,
-        num_workers=4,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
+    # Optimized data loaders for large datasets with multi-GPU support
+    train_loader = create_multi_gpu_data_loader(train_dataset, config, is_train=True)
+    val_loader = create_multi_gpu_data_loader(val_dataset, config, is_train=False)
     
     print(f"\n📊 Extensive Dataset Statistics:")
     print(f"   📈 Training samples: {len(train_dataset):,}")
@@ -1760,6 +1952,9 @@ def train_llm_model():
         num_epochs=config.num_epochs
     )
     
+    # Cleanup distributed training resources
+    trainer.cleanup()
+    
     training_time = time.time() - start_time
     
     # Save final model
@@ -1789,21 +1984,9 @@ def train_vision_model():
     train_dataset = DatasetFactory.create_vision_dataset(train=True)
     val_dataset = DatasetFactory.create_vision_dataset(train=False)
     
-    # Create optimized data loaders for vision data
-    from src.datasets.vision_datasets import VisionDatasetFactory
-    
-    train_loader = VisionDatasetFactory.create_data_loader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=4  # More workers for image processing
-    )
-    val_loader = VisionDatasetFactory.create_data_loader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=4
-    )
+    # Create optimized data loaders for vision data with multi-GPU support
+    train_loader = create_multi_gpu_data_loader(train_dataset, config, is_train=True)
+    val_loader = create_multi_gpu_data_loader(val_dataset, config, is_train=False)
     
     model = LiquidSpikingNetwork(config)
     trainer = LiquidSpikingTrainer(model, config)
@@ -1813,6 +1996,7 @@ def train_vision_model():
     print(f"   Validation samples: {len(val_dataset):,}")
     
     train_losses, val_losses = trainer.train(train_loader, val_loader, num_epochs=20)
+    trainer.cleanup()
     trainer.save_checkpoint("vision_model_final.pt")
     
     return model, trainer
@@ -1826,21 +2010,9 @@ def train_robotics_model():
     train_dataset = DatasetFactory.create_robotics_dataset(train=True)
     val_dataset = DatasetFactory.create_robotics_dataset(train=False)
     
-    # Create optimized data loaders for robotics sequences
-    from src.datasets.robotics_datasets import RoboticsDatasetFactory
-    
-    train_loader = RoboticsDatasetFactory.create_data_loader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=2  # Reduced for robotics sequences
-    )
-    val_loader = RoboticsDatasetFactory.create_data_loader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=2
-    )
+    # Create optimized data loaders for robotics sequences with multi-GPU support
+    train_loader = create_multi_gpu_data_loader(train_dataset, config, is_train=True)
+    val_loader = create_multi_gpu_data_loader(val_dataset, config, is_train=False)
     
     model = LiquidSpikingNetwork(config)
     trainer = LiquidSpikingTrainer(model, config)
@@ -1850,6 +2022,7 @@ def train_robotics_model():
     print(f"   Validation sequences: {len(val_dataset):,}")
     
     train_losses, val_losses = trainer.train(train_loader, val_loader, num_epochs=30)
+    trainer.cleanup()
     trainer.save_checkpoint("robotics_model_final.pt")
     
     return model, trainer
